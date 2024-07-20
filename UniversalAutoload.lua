@@ -101,6 +101,7 @@ function UniversalAutoload.initSpecialization()
 		s.schema:register(XMLValueType.BOOL, s.key..".options#isBoxTrailer", "If trailer is enclosed with a rear door", false)
 		s.schema:register(XMLValueType.BOOL, s.key..".options#isLogTrailer", "If trailer is a logging trailer - will load only logs, dropped from above", false)
 		s.schema:register(XMLValueType.BOOL, s.key..".options#isBaleTrailer", "If trailer should use an automatic bale collection mode", false)
+		s.schema:register(XMLValueType.BOOL, s.key..".options#isBaleProcessor", "If trailer should consume bales (e.g. TMR Mixer or Straw Blower)", false)
 		s.schema:register(XMLValueType.BOOL, s.key..".options#isCurtainTrailer", "Automatically detect the available load side (if the trailer has curtain sides)", false)
 		s.schema:register(XMLValueType.BOOL, s.key..".options#enableRearLoading", "Use the automatic rear loading trigger", false)
 		s.schema:register(XMLValueType.BOOL, s.key..".options#enableSideLoading", "Use the automatic side loading triggers", false)
@@ -1548,6 +1549,7 @@ function UniversalAutoload:onLoad(savegame)
 						spec.isBoxTrailer = config.isBoxTrailer
 						spec.isLogTrailer = config.isLogTrailer
 						spec.isBaleTrailer = config.isBaleTrailer
+						spec.isBaleProcessor = config.isBaleProcessor
 						spec.isCurtainTrailer = config.isCurtainTrailer
 						spec.enableRearLoading = config.enableRearLoading
 						spec.enableSideLoading = config.enableSideLoading
@@ -1615,10 +1617,12 @@ function UniversalAutoload:onLoad(savegame)
 							j = j + 1
 						end
 						local isBaleTrailer = xmlFile:getValue(key..".options#isBaleTrailer", nil)
+						local isBaleProcessor = xmlFile:getValue(key..".options#isBaleProcessor", nil)
 						local horizontalLoading = xmlFile:getValue(key..".options#horizontalLoading", nil)
 						
-						spec.horizontalLoading = horizontalLoading or isBaleTrailer or false
+						spec.horizontalLoading = horizontalLoading or isBaleTrailer or isBaleProcessor or false
 						spec.isBaleTrailer = isBaleTrailer or hasBaleHeight
+						spec.isBaleProcessor = isBaleProcessor
 						
 						spec.isBoxTrailer = xmlFile:getValue(key..".options#isBoxTrailer", false)
 						spec.isLogTrailer = xmlFile:getValue(key..".options#isLogTrailer", false)
@@ -1782,6 +1786,9 @@ function UniversalAutoload:onLoad(savegame)
 				link(spec.loadVolume.rootNode, leftPickupTrigger.node)
 				
 				local width, height, length = 1.66*spec.loadVolume.width, 2*spec.loadVolume.height, spec.loadVolume.length+spec.loadVolume.width/2
+				if spec.frontUnloadingOnly or spec.rearUnloadingOnly or spec.isCurtainTrailer then
+					length = 0.85 * length
+				end
 
 				setRotation(leftPickupTrigger.node, 0, 0, 0)
 				setTranslation(leftPickupTrigger.node, 1.1*(width+spec.loadVolume.width)/2, 0, 0)
@@ -1798,6 +1805,9 @@ function UniversalAutoload:onLoad(savegame)
 				link(spec.loadVolume.rootNode, rightPickupTrigger.node)
 				
 				local width, height, length = 1.66*spec.loadVolume.width, 2*spec.loadVolume.height, spec.loadVolume.length+spec.loadVolume.width/2
+				if spec.frontUnloadingOnly or spec.rearUnloadingOnly or spec.isCurtainTrailer then
+					length = 0.85 * length
+				end
 
 				setRotation(rightPickupTrigger.node, 0, 0, 0)
 				setTranslation(rightPickupTrigger.node, -1.1*(width+spec.loadVolume.width)/2, 0, 0)
@@ -2347,6 +2357,7 @@ function UniversalAutoload:onReadStream(streamId, connection)
 		spec.isBoxTrailer = streamReadBool(streamId)
 		spec.isLogTrailer = streamReadBool(streamId)
 		spec.isBaleTrailer = streamReadBool(streamId)
+		spec.isBaleProcessor = streamReadBool(streamId)
 		spec.isCurtainTrailer = streamReadBool(streamId)
 		spec.rearUnloadingOnly = streamReadBool(streamId)
 		spec.frontUnloadingOnly = streamReadBool(streamId)
@@ -2380,6 +2391,7 @@ function UniversalAutoload:onWriteStream(streamId, connection)
 		spec.isBoxTrailer = spec.isBoxTrailer or false
 		spec.isLogTrailer = spec.isLogTrailer or false
 		spec.isBaleTrailer = spec.isBaleTrailer or false
+		spec.isBaleProcessor = spec.isBaleProcessor or false
 		spec.isCurtainTrailer = spec.isCurtainTrailer or false
 		spec.rearUnloadingOnly = spec.rearUnloadingOnly or false
 		spec.frontUnloadingOnly = spec.frontUnloadingOnly or false
@@ -2399,6 +2411,7 @@ function UniversalAutoload:onWriteStream(streamId, connection)
 		streamWriteBool(streamId, spec.isBoxTrailer)
 		streamWriteBool(streamId, spec.isLogTrailer)
 		streamWriteBool(streamId, spec.isBaleTrailer)
+		streamWriteBool(streamId, spec.isBaleProcessor)
 		streamWriteBool(streamId, spec.isCurtainTrailer)
 		streamWriteBool(streamId, spec.rearUnloadingOnly)
 		streamWriteBool(streamId, spec.frontUnloadingOnly)
@@ -2528,6 +2541,62 @@ function UniversalAutoload:onUpdate(dt, isActiveForInput, isActiveForInputIgnore
 					UniversalAutoload.showWarningMessage(self, 3)
 				end
 				spec.autoLoadingObjects[object] = nil
+			end
+		end
+		
+		-- CHECK STATUS OF MIXER WAGONS
+		if spec.isBaleProcessor and self.spec_mixerWagon then
+			if spec.loadedObjects ~= nil and self.spec_mixerWagon.baleTriggers then
+
+				local fillTypes = self.spec_mixerWagon.fillTypeToMixerWagonFillType
+				local totalFillLevel = self.spec_fillUnit.fillUnits[1].fillLevel
+				local totalCapacity = self.spec_fillUnit.fillUnits[1].capacity
+
+				local function requiresMore(fillType)
+					local fillTypeData = fillTypes[fillType]
+					local ratio = fillTypeData.ratio
+					local fillLevel = fillTypeData.fillLevel
+					local minPercentage = fillTypeData.minPercentage
+					local maxPercentage = fillTypeData.maxPercentage
+					local avgPercentage = (minPercentage + maxPercentage) / 2
+					
+					if totalCapacity > 0 then
+						local percentage = fillLevel / totalCapacity
+						if percentage > avgPercentage then
+							return false
+						end
+					end
+					
+					if totalFillLevel > 0 then
+						local percentage = fillLevel / totalFillLevel
+						if percentage > 0.99*maxPercentage then
+							return false
+						end
+					end
+
+					return true
+				end
+				
+				for _, object in pairs(spec.loadedObjects) do
+					if object ~= nil and object.isRoundbale~=nil then
+						local hasBale = false
+						for _, baleTrigger in ipairs(self.spec_mixerWagon.baleTriggers) do
+							for bale, _ in pairs(baleTrigger.balesInTrigger) do
+								if object == bale then
+									hasBale = true
+									if not requiresMore(bale.fillType) then
+										baleTrigger.balesInTrigger[bale] = nil
+									end
+								end
+							end
+						end
+						if hasBale == false and requiresMore(object.fillType) then
+							local baleTrigger = self.spec_mixerWagon.baleTriggers[1]
+							baleTrigger.balesInTrigger[object] = baleTrigger.balesInTrigger[object] or 1
+						end
+					end
+				end
+
 			end
 		end
 		
@@ -2753,6 +2822,7 @@ function UniversalAutoload:onUpdate(dt, isActiveForInput, isActiveForInputIgnore
 							end
 						end
 						lastObject = object
+						if debugLoading then print("TRY LOADING OBJECT: "..object.i3dFilename) end
 						if UniversalAutoload.loadObject(self, object, true) then
 							loadedObject = true
 							if spec.firstAttemptToLoad then
@@ -2765,6 +2835,7 @@ function UniversalAutoload:onUpdate(dt, isActiveForInput, isActiveForInputIgnore
 						break
 					end
 					if not loadedObject then
+						if debugLoading then print("...FAILED LOADING OBJECT") end
 						if #spec.sortedObjectsToLoad > 0 and lastObject ~= nil then
 							local i = #spec.sortedObjectsToLoad
 							for _ = 1, #spec.sortedObjectsToLoad do
@@ -2998,6 +3069,13 @@ function UniversalAutoload:isValidForLoading(object)
 			return false
 		end
 	end
+	
+	if spec.isBaleProcessor and self.spec_mixerWagon then
+		local fillTypes = self.spec_mixerWagon.fillTypeToMixerWagonFillType
+		if not fillTypes or not fillTypes[object.fillType] then
+			return false
+		end
+	end
 
 	--if debugPallets then print(object.i3dFilename, "Valid For Loading") end
 	return true
@@ -3005,8 +3083,22 @@ end
 --
 function UniversalAutoload:isValidForUnloading(object)
 	local spec = self.spec_universalAutoload
+	
+	if not UniversalAutoload.getPalletIsSelectedMaterial(self, object) then
+		return false
+	end
+	if not UniversalAutoload.getPalletIsSelectedContainer(self, object) then
+		return false
+	end
+	if spec.autoLoadingObjects[object] ~= nil then
+		return false
+	end
+	if spec.isBaleProcessor and not object.allowPickup then
+		--DebugUtil.printTableRecursively(object, "--", 0, 1)
+		return false
+	end
 
-	return UniversalAutoload.getPalletIsSelectedMaterial(self, object) and UniversalAutoload.getPalletIsSelectedContainer(self, object) and spec.autoLoadingObjects[object] == nil
+	return true
 end
 --
 function UniversalAutoload.isValidForManualLoading(object)
@@ -3204,16 +3296,37 @@ function UniversalAutoload:loadObject(object, chargeForLoading)
 				end
 				return true
 			end
+		else
+			if debugLoading then print("NO LOAD PLACE FOUND: "..containerType.name) end
 		end
 
 	end
-
+	
+	if debugLoading then
+		if not UniversalAutoload.getIsLoadingVehicleAllowed(self) then
+			print("*** LOADING NOT ALLOWED ***")
+		end
+		if not UniversalAutoload.isValidForLoading(self, object) then
+			print("*** OBJECT IS NOT VALID ***")
+		end
+	end
 	return false
 end
 --
 function UniversalAutoload:unloadObject(object, unloadPlace)
-	-- print("UniversalAutoload - unloadObject")
+	local spec = self.spec_universalAutoload
+	
 	if object ~= nil and UniversalAutoload.isValidForUnloading(self, object) then
+	
+		if spec.isBaleProcessor then
+			if self.spec_mixerWagon and self.spec_mixerWagon.baleTriggers then
+				for _, baleTrigger in ipairs(self.spec_mixerWagon.baleTriggers) do
+					if baleTrigger.balesInTrigger[object] then
+						baleTrigger.balesInTrigger[object] = nil
+					end
+				end
+			end
+		end
 	
 		if UniversalAutoload.moveObjectNodes(self, object, unloadPlace, false, false) then
 			UniversalAutoload.clearPalletFromAllVehicles(self, object)
@@ -3619,6 +3732,7 @@ end
 --
 function UniversalAutoload:resetLoadingArea()
 	local spec = self.spec_universalAutoload
+	if debugLoading then print("RESET AREA") end
 	UniversalAutoload.resetLoadingLayer(self)
 	UniversalAutoload.resetLoadingPattern(self)
 	spec.trailerIsFull = false
@@ -3630,6 +3744,7 @@ function UniversalAutoload:getLoadPlace(containerType, object)
 	local spec = self.spec_universalAutoload
 	
 	if containerType==nil or (spec.trailerIsFull and not spec.partiallyUnloaded) then
+		if debugLoading then print("containerType==nil or trailerIsFull") end
 		return
 	end
 	
@@ -3969,31 +4084,31 @@ function UniversalAutoload:getIsLoadingVehicleAllowed()
 		if debugVehicles then print(self:getFullName() .. ": UAL DISABLED - getIsLoadingVehicleAllowed") end
 		return false
 	end
-	
-	if self:ualGetIsFilled() then
-		-- print("ualGetIsFilled")
+
+	if self:ualGetIsFilled() and not spec.isBaleProcessor then
+		if debugLoading then print(self:getFullName() .. " - NO LOADING IF FILLED") end
 		return false
 	end
 	if spec.noLoadingIfFolded and (self:ualGetIsFolding() or not self:getIsUnfolded()) then
-		-- print("noLoadingIfFolded")
+		if debugLoading then print(self:getFullName() .. " - NO LOADING IF FOLDED") end
 		return false
 	end
 	if spec.noLoadingIfUnfolded and (self:ualGetIsFolding() or self:getIsUnfolded()) then
-		-- print("noLoadingIfUnfolded")
+		if debugLoading then print(self:getFullName() .. " - NO LOADING IF UNFOLDED") end
 		return false
 	end
 	if spec.noLoadingIfCovered and self:ualGetIsCovered() then
-		-- print("noLoadingIfCovered")
+		if debugLoading then print(self:getFullName() .. " - NO LOADING IF COVERED") end
 		return false
 	end
 	if spec.noLoadingIfUncovered and not self:ualGetIsCovered() then
-		-- print("noLoadingIfUncovered")
+		if debugLoading then print(self:getFullName() .. " - NO LOADING IF UNCOVERED") end
 		return false
 	end
 
 	local node = UniversalAutoload.getObjectPositionNode( self )
 	if node == nil then
-		-- print("node == nil")
+		if debugLoading then print(self:getFullName() .. " - NO LOADING IF node == nil") end
 		return false
 	end
 	
@@ -4002,7 +4117,7 @@ function UniversalAutoload:getIsLoadingVehicleAllowed()
 		local _, y1, _ = getWorldTranslation(node)
 		local _, y2, _ = localToWorld(node, 0, 1, 0)
 		if y2 - y1 < 0.5 then
-			-- print("NO LOADING IF FALLEN OVER")
+			if debugLoading then print(self:getFullName() .. " - NO LOADING IF FALLEN OVER") end
 			return false
 		end
 	end
@@ -4535,7 +4650,7 @@ function UniversalAutoload:ualPlayerTrigger_Callback(triggerId, otherActorId, on
 					local spec = self.spec_universalAutoload
 					local playerId = player.userId
 					
-					if onEnter then
+					if onEnter or onStay then
 						UniversalAutoload.updatePlayerTriggerState(self, playerId, true)
 						UniversalAutoload.forceRaiseActive(self, true)
 					else
@@ -4556,7 +4671,7 @@ function UniversalAutoload:ualLoadingTrigger_Callback(triggerId, otherActorId, o
 		local object = UniversalAutoload.getNodeObject(otherActorId)
 		if object ~= nil then
 			if UniversalAutoload.getIsValidObject(self, object) then
-				if onEnter then
+				if onEnter or onStay then
 					UniversalAutoload.addAvailableObject(self, object, triggerId)
 				elseif onLeave then
 					UniversalAutoload.removeAvailableObject(self, object, triggerId)
@@ -4572,7 +4687,7 @@ function UniversalAutoload:ualUnloadingTrigger_Callback(triggerId, otherActorId,
 		local object = UniversalAutoload.getNodeObject(otherActorId)
 		if object ~= nil then
 			if UniversalAutoload.getIsValidObject(self, object) then
-				if onEnter then
+				if onEnter or onStay then
 					if debugLoading then print(" UnloadingTrigger ENTER: " .. tostring(object.id)) end
 					UniversalAutoload.addLoadedObject(self, object)
 				elseif onLeave then
@@ -4658,6 +4773,7 @@ function UniversalAutoload:addAvailableObject(object, triggerId)
 	end
 	
 	if spec.availableObjects[object] == nil and spec.loadedObjects[object] == nil then
+		if debugLoading then print(tostring(object.id) .. " IN " .. tostring(triggerId)) end
 		spec.availableObjects[object] = object
 		spec.objectToTriggerId[object] = triggerId
 		spec.totalAvailableCount = spec.totalAvailableCount + 1
@@ -4681,6 +4797,7 @@ function UniversalAutoload:removeAvailableObject(object, triggerId)
 	local isActiveForLoading = spec.isLoading or spec.isUnloading or spec.doPostLoadDelay
 	
 	if spec.availableObjects[object] ~= nil and (triggerId == nil or spec.objectToTriggerId[object] == triggerId) then
+		if debugLoading then print(tostring(object.id) .. " OUT " .. tostring(triggerId)) end
 		spec.availableObjects[object] = nil
 		spec.objectToTriggerId[object] = nil
 		spec.totalAvailableCount = spec.totalAvailableCount - 1
